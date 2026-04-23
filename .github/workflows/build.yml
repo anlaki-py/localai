@@ -1,0 +1,188 @@
+name: Build and Release Android App
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'app/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'app/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        cache-read-only: ${{ github.event_name == 'pull_request' }}
+        gradle-home-cache-cleanup: true
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    - name: Run lint
+      run: ./gradlew lintDebug --no-daemon --stacktrace
+
+    - name: Upload lint results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: lint-results
+        path: |
+          app/build/reports/lint-results-debug.html
+          app/build/reports/lint-results-debug.xml
+
+    - name: Run unit tests
+      run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: |
+          app/build/test-results/
+          app/build/reports/tests/
+
+    - name: Build release APK (unsigned)
+      run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+    - name: Download signing keystore
+      env:
+        KEY_URL: ${{ secrets.KEY_URL }}
+      run: |
+        if [ -z "$KEY_URL" ]; then
+          echo "Error: KEY_URL secret is not set"
+          exit 1
+        fi
+        curl -L -o release.keystore "$KEY_URL"
+        ls -la release.keystore
+
+    - name: Sign APK
+      env:
+        KEYSTORE_PASSWORD: "android"
+        KEY_ALIAS: "androiddebugkey"
+        KEY_PASSWORD: "android"
+      run: |
+        # Find the unsigned APK
+        UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+        echo "Found APK: $UNSIGNED_APK"
+        
+        # Sign the APK using apksigner
+        $ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner sign \
+          --ks release.keystore \
+          --ks-pass pass:$KEYSTORE_PASSWORD \
+          --key-pass pass:$KEY_PASSWORD \
+          --ks-key-alias $KEY_ALIAS \
+          --out app/build/outputs/apk/release/app-release-signed.apk \
+          "$UNSIGNED_APK"
+        
+        # Verify the signed APK
+        $ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner verify app/build/outputs/apk/release/app-release-signed.apk
+        echo "APK signed successfully!"
+
+    - name: Determine next version
+      id: version
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      run: |
+        # Get the latest release version
+        LATEST_RELEASE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/latest" | \
+          jq -r '.tag_name // empty')
+        
+        if [ -z "$LATEST_RELEASE" ]; then
+          # No releases exist, start with 0.0.1
+          NEXT_VERSION="v0.0.1"
+        else
+          # Parse version (remove 'v' prefix if exists)
+          VERSION=${LATEST_RELEASE#v}
+          
+          # Split into major.minor.patch
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          
+          # Increment patch version
+          PATCH=$((PATCH + 1))
+          
+          # Handle rollover (e.g., 0.0.99 -> 0.1.0)
+          if [ "$PATCH" -gt 99 ]; then
+            PATCH=0
+            MINOR=$((MINOR + 1))
+          fi
+          if [ "$MINOR" -gt 99 ]; then
+            MINOR=0
+            MAJOR=$((MAJOR + 1))
+          fi
+          
+          NEXT_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+        fi
+        
+        echo "Previous version: ${LATEST_VERSION:-none}"
+        echo "Next version: $NEXT_VERSION"
+        echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        name: Release ${{ steps.version.outputs.version }}
+        body: |
+          ## Release ${{ steps.version.outputs.version }}
+          
+          Automatically built and signed from commit ${{ github.sha }}.
+          
+          ### Changes
+          - See [commit history](https://github.com/${{ github.repository }}/commits/${{ github.sha }})
+        files: |
+          app/build/outputs/apk/release/app-release-signed.apk
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload unsigned artifacts (for PRs)
+      uses: actions/upload-artifact@v4
+      if: github.event_name == 'pull_request'
+      with:
+        name: release-apk-unsigned
+        path: app/build/outputs/apk/release/app-release-unsigned.apk
+        retention-days: 7
